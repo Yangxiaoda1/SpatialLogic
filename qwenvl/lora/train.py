@@ -10,6 +10,7 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
+import math
 from qwen_vl_utils import process_vision_info
 from peft import prepare_model_for_kbit_training
 import json
@@ -35,7 +36,7 @@ class VideoFinetuneDataset(Dataset):
                     self.task_desc[taskname][episodename] = {}
                     prilist = episode['label_info']['action_config']
                     for pri in prilist:
-                        for i in range(pri['start_frame'], pri['end_frame'] + 1):
+                        for i in range(math.ceil(pri['start_frame']/10), math.floor(pri['end_frame']/10)):
                             self.task_desc[taskname][episodename][i] = pri['action_text']
 
         for sub1 in os.listdir(image_path):  # 327
