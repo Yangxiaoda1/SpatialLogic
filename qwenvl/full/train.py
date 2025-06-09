@@ -15,6 +15,7 @@ from transformers import (
     TrainingArguments,
     TrainerCallback
 )
+import math
 
 
 class VideoFinetuneDataset(Dataset):
@@ -35,7 +36,7 @@ class VideoFinetuneDataset(Dataset):
                     eid = str(episode['episode_id'])
                     self.task_desc[taskname][eid] = {}
                     for pri in episode['label_info']['action_config']:
-                        for i in range(pri['start_frame'], pri['end_frame'] + 1):
+                        for i in range(math.ceil(pri['start_frame']/10), math.floor(pri['end_frame']/10)):
                             self.task_desc[taskname][eid][i] = pri['action_text']
 
         for sub1 in os.listdir(image_path):
@@ -108,7 +109,7 @@ if __name__ == "__main__":
     parser.add_argument("--window_size", type=int, nargs='+', default=[5,10,15], help="滑动窗口大小列表，默认 [5,10,15]")
     parser.add_argument("--max_length", type=int, default=128, help="文本部分最大长度，默认128")
     parser.add_argument("--output_dir", type=str, default="/home/tione/notebook/SpacialLogic-Demo/qwenvl/full/mycheckpoint", help="输出目录")
-    parser.add_argument("--epochs", type=int, default=10, help="训练 epoch 数量")
+    parser.add_argument("--epochs", type=int, default=5, help="训练 epoch 数量")
     parser.add_argument("--batch_size", type=int, default=1, help="每个设备的 batch 大小（可根据显存调节）")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="学习率")
     args = parser.parse_args()
@@ -133,7 +134,7 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         weight_decay=0.01,
         logging_steps=10,
-        save_steps=500,
+        save_steps=2000,
         fp16=False,
         bf16=True,
         max_grad_norm=1.0,
