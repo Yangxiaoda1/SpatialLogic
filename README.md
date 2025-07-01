@@ -36,3 +36,7 @@
 ```
 5. 拉取项目：
 git clone https://github.com/Yangxiaoda1/SpatialLogic.git
+
+[Optional]Cot数据生成：调用GPT接管，然后人工矫正
+python datamaker.py
+
