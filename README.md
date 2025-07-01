@@ -32,10 +32,11 @@ git clone https://github.com/Yangxiaoda1/SpatialLogic.git
 ```
 如果要做拟合测试，可以只解压一个任务，构造类似结构：
 ```bash
-|-SpacialLogic-Demo
+|-Demo
     |-clips
     |-...
 ```
+在https://huggingface.co/datasets/yangxiaoda/SpacialLogic里提供了任务327的处理好的clips以及cot数据，可以直接供给训练测试
 
 
 [Optional] Cot数据生成：调用GPT接管，然后人工矫正
