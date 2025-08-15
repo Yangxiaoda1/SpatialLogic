@@ -1,0 +1,450 @@
+#!/usr/bin/env python
+# coding=utf-8
+"""
+Train Qwen2.5-VL on CoT-style JSON data (images + prompt + analysis + closer_to_completion).
+全量微调版本 - 训练所有模型参数
+
+注意：全量微调需要更多的GPU显存和计算资源，建议使用多GPU训练。
+
+使用说明：
+1. 修改文件顶部的路径配置区域，设置你的环境路径
+2. 根据需要调整训练参数配置区域
+3. 运行命令：python train_cot.py [可选参数]
+
+可选参数：
+  --cot_files: COT数据文件列表
+  --base_dir: 项目根目录（包含testset文件夹）
+  --model_path: 模型路径
+  --output_dir: 输出目录
+  --epochs: 训练轮数
+  --batch_size: 批次大小（建议使用较小的batch_size）
+  --learning_rate: 学习率（建议使用较小的学习率如1e-5）
+  --max_samples: 最大样本数
+  --from_pretrained: 是否从预训练模型加载
+  --accelerate: 是否使用accelerate进行分布式训练
+"""
+
+# ==================== 默认配置区域 ====================
+# 这些是默认值，可以通过命令行参数覆盖
+DEFAULT_CONFIG = {
+    "base_dir": "/home/tione/notebook/Spaciallogic",  # 项目根目录
+    "model_path": "/home/tione/notebook/Spaciallogic/Qwen2.5-VL-7B-Instruct",  # 模型路径
+    "output_dir": "/home/tione/notebook/Spaciallogic/qwenvl/full/cot_checkpoint",  # 输出目录
+    "cot_files": ["new_forward.json", "new_reverse.json"],  # COT数据文件列表
+    "epochs": 1,                    # 训练轮数
+    "batch_size": 1,                # 批次大小（全量微调建议使用较小的batch_size）
+    "learning_rate": 1e-5,          # 学习率（全量微调使用较小的学习率）
+    "max_samples": 2000,            # 最大样本数（设为0表示使用全部数据）
+    "max_steps": 2000,              # 最大训练步数
+    "gradient_accumulation_steps": 16,  # 梯度累积步数（全量微调需要更多累积）
+    "warmup_steps": 100,            # 预热步数
+    "save_steps": 100,              # 保存检查点步数
+    "logging_steps": 1,             # 日志记录步数
+    "max_grad_norm": 1.0,           # 梯度裁剪阈值（全量微调使用更大的阈值）
+    "weight_decay": 0.01,           # 权重衰减（全量微调使用更大的权重衰减）
+}
+# ===================================================
+
+import os
+# Reduce thread contention / avoid OpenBLAS OpenMP loop warnings
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TORCH_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import json
+import argparse
+from typing import List, Dict, Any
+
+import torch
+try:
+    torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
+    if hasattr(torch, "set_num_interop_threads"):
+        torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
+from PIL import Image
+from torch.utils.data import Dataset
+from transformers import (
+    Qwen2_5_VLForConditionalGeneration,
+    AutoProcessor,
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
+)
+
+# 导入accelerate相关模块
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    print("Warning: accelerate not available, falling back to basic training")
+
+
+def resolve_path(p: str, base_dir: str) -> str:
+    """Normalize a possibly Windows-style relative path, and try to fix trailing '_' dirs.
+    base_dir: Directory from which to resolve relative paths (e.g., repo root containing 'testset').
+    """
+    if not p:
+        return p
+    # Normalize slashes
+    p_norm = p.replace("\\", os.sep)
+    if os.path.isabs(p_norm):
+        cand = p_norm
+    else:
+        cand = os.path.join(base_dir, p_norm)
+    if os.path.exists(cand):
+        return cand
+    # attempt replacing any component ending with '_' to '.'
+    parts = cand.split(os.sep)
+    for i in range(len(parts)):
+        if parts[i].endswith('_'):
+            alt_parts = parts.copy()
+            alt_parts[i] = alt_parts[i][:-1] + '.'
+            alt = os.sep.join(alt_parts)
+            if os.path.exists(alt):
+                return alt
+    return cand  # return best-effort even if not exists; downstream will error if missing
+
+
+class CoTDataset(Dataset):
+    def __init__(self, processor, cot_files: List[str], base_dir: str, max_samples: int = None):
+        self.processor = processor
+        # Treat <=0 as unlimited
+        if max_samples is not None and max_samples <= 0:
+            max_samples = None
+        self.samples: List[Dict[str, Any]] = []
+        loaded = 0
+        for jf in cot_files:
+            jf_abs = jf if os.path.isabs(jf) else os.path.abspath(jf)
+            if not os.path.exists(jf_abs):
+                print(f"[WARN] CoT file not found: {jf_abs}")
+                continue
+            with open(jf_abs, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # data may be a single object or a list
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                messages = item.get('messages', [])
+                # Normalize image paths in-place
+                for m in messages:
+                    if 'content' in m and isinstance(m['content'], list):
+                        for c in m['content']:
+                            if isinstance(c, dict) and c.get('type') == 'image' and 'image' in c:
+                                c['image'] = resolve_path(c['image'], base_dir)
+                tgt = item.get('target', {})
+                analysis = tgt.get('analysis', '')
+                closer = tgt.get('closer_to_completion', tgt.get('closer to completion', ''))
+                
+                # 保留原始prompt，不要硬编码格式
+                if analysis and closer:
+                    # 直接使用JSON中的原始内容，不做格式转换
+                    target_text = analysis + "\n" + closer
+                else:
+                    print(f"Warning: missing analysis or closer_to_completion in sample")
+                    target_text = "No analysis available"
+                self.samples.append({
+                    'messages': messages,
+                    'target': target_text
+                })
+                loaded += 1
+                if max_samples is not None and loaded >= max_samples:
+                    break
+            if max_samples is not None and loaded >= max_samples:
+                break
+        if len(self.samples) == 0:
+            print("[WARN] No samples loaded from CoT files.")
+        else:
+            print(f"Loaded {len(self.samples)} samples from CoT files.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        messages = sample['messages']
+        target = sample['target']
+        
+        # 验证目标文本长度
+        if len(target) > 1000:  # 限制目标文本长度
+            target = target[:1000]
+        
+        # open images in order
+        image_inputs = []
+        for m in messages:
+            for c in m.get('content', []):
+                if isinstance(c, dict) and c.get('type') == 'image':
+                    try:
+                        img = Image.open(c['image']).convert('RGB')
+                        image_inputs.append(img)
+                    except Exception as e:
+                        print(f"Error loading image {c['image']}: {e}")
+                        # 如果图片加载失败，使用一个默认的1x1像素图片
+                        img = Image.new('RGB', (1, 1), color='black')
+                        image_inputs.append(img)
+        
+        chat_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        full_text = chat_prompt + "\nassistant\n" + target
+        
+        # 重要：禁用truncation以保持多模态token对齐
+        inputs = self.processor(
+            text=full_text, 
+            images=image_inputs, 
+            return_tensors='pt', 
+            padding=True, 
+            truncation=False  # 禁用truncation避免图片token不匹配
+        )
+        
+        input_ids = inputs.input_ids.squeeze(0)
+        attention_mask = inputs.attention_mask.squeeze(0)
+        
+        # mask out prompt tokens in labels
+        prefix_len = self.processor.tokenizer(chat_prompt + "\nassistant\n", return_tensors='pt').input_ids.shape[-1] - 1
+        labels = input_ids.clone()
+        labels[:prefix_len] = -100
+        
+        # 确保有足够的有效标签
+        valid_label_count = (labels != -100).sum().item()
+        if valid_label_count == 0:
+            print(f"Warning: sample {idx} has no valid labels, setting last few tokens as valid")
+            # 设置最后几个token为有效标签
+            labels[-3:] = input_ids[-3:]  # 保留最后3个token作为标签
+        
+        # 处理pad token
+        if hasattr(self.processor.tokenizer, 'pad_token_id') and self.processor.tokenizer.pad_token_id is not None:
+            labels[labels == self.processor.tokenizer.pad_token_id] = -100
+            
+        # 最终验证
+        final_valid_count = (labels != -100).sum().item()
+        if final_valid_count == 0:
+            print(f"Error: sample {idx} still has no valid labels after fixing")
+            # 强制设置一些标签
+            labels[-1] = input_ids[-1]
+        
+        # 添加样本信息调试
+        if idx < 3:
+            print(f"Sample {idx}: input_len={len(input_ids)}, prefix_len={prefix_len}, valid_labels={final_valid_count}")
+            print(f"  Target length: {len(target)}")
+            print(f"  Target preview: {target[:100]}...")
+            print(f"  Labels: {labels.tolist()[-10:]}")  # 显示最后10个标签
+            
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def collate_fn(batch):
+    """
+    处理变长序列的collate函数
+    支持不同长度的input_ids、attention_mask和labels
+    """
+    # 获取所有样本的键
+    keys = batch[0].keys()
+    
+    # 找到最大长度
+    max_length = max(len(b['input_ids']) for b in batch)
+    
+    # 初始化结果字典
+    result = {}
+    
+    for key in keys:
+        if key in ['input_ids', 'attention_mask', 'labels']:
+            # 对于需要padding的张量
+            padded_tensors = []
+            for b in batch:
+                tensor = b[key]
+                current_length = len(tensor)
+                
+                if current_length < max_length:
+                    # 需要padding
+                    if key == 'labels':
+                        # labels用-100填充
+                        padding = torch.full((max_length - current_length,), -100, dtype=tensor.dtype)
+                    else:
+                        # input_ids和attention_mask用0填充
+                        padding = torch.zeros(max_length - current_length, dtype=tensor.dtype)
+                    
+                    padded_tensor = torch.cat([tensor, padding])
+                else:
+                    padded_tensor = tensor
+                
+                padded_tensors.append(padded_tensor)
+            
+            # 堆叠所有padded张量
+            result[key] = torch.stack(padded_tensors)
+        else:
+            # 对于其他键，直接堆叠
+            result[key] = torch.stack([b[key] for b in batch])
+    
+    return result
+
+
+class GradientNaNCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        if model is None:
+            return
+            
+        # 检查NaN和Inf梯度
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                grad = p.grad.data
+                if torch.isnan(grad).any():
+                    print(f"NaN grad at {name}, replacing with zeros")
+                    p.grad.data = torch.where(torch.isnan(grad), torch.zeros_like(grad), grad)
+                elif torch.isinf(grad).any():
+                    print(f"Inf grad at {name}, replacing with zeros")
+                    p.grad.data = torch.where(torch.isinf(grad), torch.zeros_like(grad), grad)
+                
+                # 使用args.max_grad_norm进行梯度裁剪
+                grad_norm = grad.norm()
+                if grad_norm > args.max_grad_norm:
+                    print(f"Large grad at {name}: {grad_norm.item()}, clipping to {args.max_grad_norm}")
+                    p.grad.data = torch.clamp(grad, -args.max_grad_norm, args.max_grad_norm)
+                elif torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Invalid grad norm at {name}: {grad_norm.item()}, zeroing")
+                    p.grad.data = torch.zeros_like(grad)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Full Fine-tune Qwen2.5-VL on CoT JSON")
+    parser.add_argument("--cot_files", nargs="+", default=DEFAULT_CONFIG["cot_files"], help="One or more CoT JSON files (e.g., new_forward.json new_reverse.json)")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_CONFIG["base_dir"], help="Base dir to resolve relative image paths (should contain testset)")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_CONFIG["model_path"], help="Local model dir")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_CONFIG["output_dir"], help="Output dir")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_CONFIG["batch_size"])
+    parser.add_argument("--learning_rate", type=float, default=DEFAULT_CONFIG["learning_rate"])
+    parser.add_argument("--max_samples", type=int, default=DEFAULT_CONFIG["max_samples"], help="Limit samples to avoid OOM on CPU")
+    parser.add_argument("--max_steps", type=int, default=DEFAULT_CONFIG["max_steps"], help="Maximum training steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=DEFAULT_CONFIG["gradient_accumulation_steps"], help="Gradient accumulation steps")
+    parser.add_argument("--warmup_steps", type=int, default=DEFAULT_CONFIG["warmup_steps"], help="Warmup steps")
+    parser.add_argument("--save_steps", type=int, default=DEFAULT_CONFIG["save_steps"], help="Save checkpoint steps")
+    parser.add_argument("--logging_steps", type=int, default=DEFAULT_CONFIG["logging_steps"], help="Logging steps")
+    parser.add_argument("--max_grad_norm", type=float, default=DEFAULT_CONFIG["max_grad_norm"], help="Max gradient norm")
+    parser.add_argument("--weight_decay", type=float, default=DEFAULT_CONFIG["weight_decay"], help="Weight decay")
+    parser.add_argument("--from_pretrained", action="store_true", help="Whether to load from a pretrained model")
+    parser.add_argument("--accelerate", action="store_true", help="Whether to use accelerate for distributed training")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+
+    # 设置随机种子
+    set_seed(args.seed)
+    
+    # 初始化accelerator（如果可用且启用）
+    if ACCELERATE_AVAILABLE and args.accelerate:
+        accelerator = Accelerator()
+        print(f"Using accelerate for distributed training")
+        device = accelerator.device
+        use_cuda = device.type == 'cuda'
+    else:
+        accelerator = None
+        use_cuda = torch.cuda.is_available()
+        device = torch.device('cuda' if use_cuda else 'cpu')
+    
+    dtype = torch.float32  # 强制使用float32提高数值稳定性
+    print(f"Using device: {device}, dtype: {dtype}")
+
+    # 加载processor
+    processor = AutoProcessor.from_pretrained(args.model_path, use_fast=False)
+    
+    # 根据from_pretrained参数决定模型加载方式
+    if args.from_pretrained:
+        print(f"Loading model from pretrained checkpoint: {args.model_path}")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.model_path,
+            device_map="auto" if accelerator is None else None,
+            torch_dtype=dtype,
+            use_cache=False,  # 禁用 KV 缓存节省显存
+            low_cpu_mem_usage=True,  # 减少 CPU 内存使用
+        )
+    else:
+        print(f"Loading model from base model: {args.model_path}")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.model_path,
+            device_map="auto" if accelerator is None else None,
+            torch_dtype=dtype,
+            use_cache=False,  # 禁用 KV 缓存节省显存
+            low_cpu_mem_usage=True,  # 减少 CPU 内存使用
+        )
+
+    # 确保use_cache为False
+    model.config.use_cache = False
+
+    # 全量微调：设置所有参数为可训练
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    print(f"全量微调模式：所有参数可训练")
+    print(f"可训练参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    
+    # 使用accelerator准备模型（如果启用）
+    if accelerator is not None:
+        model = accelerator.prepare(model)
+        print(f"Model prepared with accelerator")
+    
+    if use_cuda:
+        print(f"模型加载完成. GPU内存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    else:
+        print(f"模型加载完成. 使用CPU训练")
+
+    train_dataset = CoTDataset(
+        processor=processor,
+        cot_files=args.cot_files,
+        base_dir=args.base_dir,
+        max_samples=args.max_samples,
+    )
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.batch_size,
+        num_train_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,  # 使用args中的权重衰减
+        logging_steps=args.logging_steps,  # 使用args中的日志步数
+        save_steps=args.save_steps,  # 使用args中的保存步数
+        fp16=False,  # 禁用 FP16 避免梯度缩放问题
+        bf16=False,  # 也禁用 BF16，使用 FP32 训练
+        max_grad_norm=args.max_grad_norm,  # 使用args中的梯度裁剪阈值
+        save_total_limit=2,  # 保留2个检查点
+        logging_dir=os.path.join(args.output_dir, "logs"),
+        report_to="none",
+        dataloader_num_workers=0,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,  # 使用args中的梯度累积步数
+        optim="adamw_torch",  # 使用更稳定的AdamW优化器
+        remove_unused_columns=False,  # 保留所有列避免数据处理开销
+        warmup_steps=args.warmup_steps,  # 使用args中的预热步数
+        lr_scheduler_type="cosine",  # 使用余弦调度器，更适合全量微调
+        dataloader_drop_last=False,  # 不丢弃最后一个不完整的batch
+        max_steps=args.max_steps,  # 使用args中的最大步数
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=collate_fn,
+        callbacks=[GradientNaNCallback()],
+    )
+
+    # 训练模型
+    trainer.train()
+    
+    # 保存模型
+    if accelerator is not None:
+        # 如果使用accelerator，等待所有进程完成
+        accelerator.wait_for_everyone()
+        # 只在主进程上保存模型
+        if accelerator.is_main_process:
+            trainer.save_model(args.output_dir)
+            print(f"Model saved to {args.output_dir}")
+    else:
+        trainer.save_model(args.output_dir)
+        print(f"Model saved to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
