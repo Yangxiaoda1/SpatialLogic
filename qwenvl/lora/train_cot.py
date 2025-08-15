@@ -17,6 +17,8 @@ Train Qwen2.5-VL on CoT-style JSON data (images + prompt + analysis + closer_to_
   --batch_size: 批次大小
   --learning_rate: 学习率
   --max_samples: 最大样本数
+  --from_pretrained: 是否从预训练模型加载
+  --accelerate: 是否使用accelerate进行分布式训练
 
 JSON格式示例：
 [
@@ -32,16 +34,13 @@ JSON格式示例：
 ]
 """
 
-# ==================== 路径配置区域 ====================
-# 请根据你的环境修改以下路径
-BASE_DIR = "/home/tione/notebook/Spaciallogic"  # 项目根目录
-MODEL_PATH = "/home/tione/notebook/Spaciallogic/Qwen2.5-VL-7B-Instruct"  # 模型路径
-OUTPUT_DIR = "/home/tione/notebook/Spaciallogic/qwenvl/full/cot_checkpoint"  # 输出目录
-COT_FILES = ["new_forward.json", "new_reverse.json"]  # COT数据文件列表
-
-# ==================== 训练参数配置区域 ====================
-# 训练超参数，可根据需要调整
-TRAINING_CONFIG = {
+# ==================== 默认配置区域 ====================
+# 这些是默认值，可以通过命令行参数覆盖
+DEFAULT_CONFIG = {
+    "base_dir": "/home/tione/notebook/Spaciallogic",  # 项目根目录
+    "model_path": "/home/tione/notebook/Spaciallogic/Qwen2.5-VL-7B-Instruct",  # 模型路径
+    "output_dir": "/home/tione/notebook/Spaciallogic/qwenvl/full/cot_checkpoint",  # 输出目录
+    "cot_files": ["new_forward.json", "new_reverse.json"],  # COT数据文件列表
     "epochs": 1,                    # 训练轮数
     "batch_size": 1,                # 批次大小
     "learning_rate": 5e-6,          # 学习率
@@ -98,6 +97,15 @@ from transformers import (
     TrainerCallback,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+# 导入accelerate相关模块
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    print("Warning: accelerate not available, falling back to basic training")
 
 
 def resolve_path(p: str, base_dir: str) -> str:
@@ -282,42 +290,67 @@ class GradientNaNCallback(TrainerCallback):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Finetune Qwen2.5-VL on CoT JSON")
-    parser.add_argument("--cot_files", nargs="+", default=COT_FILES, help="One or more CoT JSON files (e.g., new_forward.json new_reverse.json)")
-    parser.add_argument("--base_dir", type=str, default=BASE_DIR, help="Base dir to resolve relative image paths (should contain testset)")
-    parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Local model dir")
-    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Output dir")
-    parser.add_argument("--epochs", type=int, default=TRAINING_CONFIG["epochs"])
-    parser.add_argument("--batch_size", type=int, default=TRAINING_CONFIG["batch_size"])
-    parser.add_argument("--learning_rate", type=float, default=TRAINING_CONFIG["learning_rate"])
-    parser.add_argument("--max_samples", type=int, default=TRAINING_CONFIG["max_samples"], help="Limit samples to avoid OOM on CPU")
+    parser = argparse.ArgumentParser(description="Full Fine-tune Qwen2.5-VL on CoT JSON")
+    parser.add_argument("--cot_files", nargs="+", default=DEFAULT_CONFIG["cot_files"], help="One or more CoT JSON files (e.g., new_forward.json new_reverse.json)")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_CONFIG["base_dir"], help="Base dir to resolve relative image paths (should contain testset)")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_CONFIG["model_path"], help="Local model dir")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_CONFIG["output_dir"], help="Output dir")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_CONFIG["batch_size"])
+    parser.add_argument("--learning_rate", type=float, default=DEFAULT_CONFIG["learning_rate"])
+    parser.add_argument("--max_samples", type=int, default=DEFAULT_CONFIG["max_samples"], help="Limit samples to avoid OOM on CPU")
+    parser.add_argument("--max_steps", type=int, default=DEFAULT_CONFIG["max_steps"], help="Maximum training steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=DEFAULT_CONFIG["gradient_accumulation_steps"], help="Gradient accumulation steps")
+    parser.add_argument("--warmup_steps", type=int, default=DEFAULT_CONFIG["warmup_steps"], help="Warmup steps")
+    parser.add_argument("--save_steps", type=int, default=DEFAULT_CONFIG["save_steps"], help="Save checkpoint steps")
+    parser.add_argument("--logging_steps", type=int, default=DEFAULT_CONFIG["logging_steps"], help="Logging steps")
+    parser.add_argument("--max_grad_norm", type=float, default=DEFAULT_CONFIG["max_grad_norm"], help="Max gradient norm")
+    parser.add_argument("--weight_decay", type=float, default=DEFAULT_CONFIG["weight_decay"], help="Weight decay")
+    parser.add_argument("--from_pretrained", action="store_true", help="Whether to load from a pretrained model")
+    parser.add_argument("--accelerate", action="store_true", help="Whether to use accelerate for distributed training")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    use_cuda = torch.cuda.is_available()
+    # 设置随机种子
+    set_seed(args.seed)
+    
+    # 初始化accelerator（如果可用且启用）
+    if ACCELERATE_AVAILABLE and args.accelerate:
+        accelerator = Accelerator()
+        print(f"Using accelerate for distributed training")
+        device = accelerator.device
+        use_cuda = device.type == 'cuda'
+    else:
+        accelerator = None
+        use_cuda = torch.cuda.is_available()
+        device = torch.device('cuda' if use_cuda else 'cpu')
+    
     dtype = torch.float32  # 强制使用float32提高数值稳定性
-    print(f"Using CUDA: {use_cuda}, dtype: {dtype}")
+    print(f"Using device: {device}, dtype: {dtype}")
 
+    # 加载processor
     processor = AutoProcessor.from_pretrained(args.model_path, use_fast=False)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.model_path,
-        device_map="auto",
-        torch_dtype=dtype,
-        use_cache=False,  # 禁用 KV 缓存节省显存
-        low_cpu_mem_usage=True,  # 减少 CPU 内存使用
-    )
+    
+    # 根据from_pretrained参数决定模型加载方式
+    if args.from_pretrained:
+        print(f"Loading model from pretrained checkpoint: {args.model_path}")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.model_path,
+            device_map="auto" if accelerator is None else None,
+            torch_dtype=dtype,
+            use_cache=False,  
+        )
+    else:
+        print(f"Loading model from base model: {args.model_path}")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.model_path,
+            device_map="auto" if accelerator is None else None,
+            torch_dtype=dtype,
+            use_cache=False, 
+        )
 
-    # 启用梯度检查点
-    model.gradient_checkpointing_enable()
     # 确保use_cache为False
     model.config.use_cache = False
-    
-    # 设置梯度缩放以提高数值稳定性
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # 清理显存
-    if use_cuda:
-        torch.cuda.empty_cache()
 
     # 配置LoRA
     lora_config = LoraConfig(
@@ -334,7 +367,16 @@ def main():
     model = get_peft_model(model, lora_config)
     
     print("LoRA model loaded. Trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
-    print(f"Model loaded. GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    
+    # 使用accelerator准备模型（如果启用）
+    if accelerator is not None:
+        model = accelerator.prepare(model)
+        print(f"Model prepared with accelerator")
+    
+    if use_cuda:
+        print(f"模型加载完成. GPU内存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    else:
+        print(f"模型加载完成. 使用CPU训练")
 
     train_dataset = CoTDataset(
         processor=processor,
@@ -348,26 +390,23 @@ def main():
         per_device_train_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
-        weight_decay=TRAINING_CONFIG["weight_decay"],  # 使用配置中的权重衰减
-        logging_steps=TRAINING_CONFIG["logging_steps"],  # 使用配置中的日志步数
-        save_steps=TRAINING_CONFIG["save_steps"],  # 使用配置中的保存步数
+        weight_decay=args.weight_decay,  # 使用args中的权重衰减
+        logging_steps=args.logging_steps,  # 使用args中的日志步数
+        save_steps=args.save_steps,  # 使用args中的保存步数
         fp16=False,  # 禁用 FP16 避免梯度缩放问题
         bf16=False,  # 也禁用 BF16，使用 FP32 训练
-        max_grad_norm=TRAINING_CONFIG["max_grad_norm"],  # 使用配置中的梯度裁剪阈值
+        max_grad_norm=args.max_grad_norm,  # 使用args中的梯度裁剪阈值
         save_total_limit=2,  # 保留2个检查点
         logging_dir=os.path.join(args.output_dir, "logs"),
         report_to="none",
         dataloader_num_workers=0,
-        gradient_checkpointing=True,  # 启用梯度检查点节省显存
-        gradient_accumulation_steps=TRAINING_CONFIG["gradient_accumulation_steps"],  # 使用配置中的梯度累积步数
+        gradient_accumulation_steps=args.gradient_accumulation_steps,  # 使用args中的梯度累积步数
         optim="adamw_torch",  # 使用更稳定的AdamW优化器
         remove_unused_columns=False,  # 保留所有列避免数据处理开销
-        dataloader_pin_memory=False,  # 禁用 pin memory 节省显存
-        warmup_steps=TRAINING_CONFIG["warmup_steps"],  # 使用配置中的预热步数
+        warmup_steps=args.warmup_steps,  # 使用args中的预热步数
         lr_scheduler_type="linear",  # 使用线性调度器，更稳定
         dataloader_drop_last=False,  # 不丢弃最后一个不完整的batch
-        gradient_checkpointing_kwargs={"use_reentrant": False},  # 禁用重入式梯度检查点
-        max_steps=TRAINING_CONFIG["max_steps"],  # 使用配置中的最大步数
+        max_steps=args.max_steps,  # 使用args中的最大步数
     )
 
     trainer = Trainer(
@@ -378,8 +417,20 @@ def main():
         callbacks=[GradientNaNCallback()],
     )
 
+    # 训练模型
     trainer.train()
-    trainer.save_model(args.output_dir)
+    
+    # 保存模型
+    if accelerator is not None:
+        # 如果使用accelerator，等待所有进程完成
+        accelerator.wait_for_everyone()
+        # 只在主进程上保存模型
+        if accelerator.is_main_process:
+            trainer.save_model(args.output_dir)
+            print(f"Model saved to {args.output_dir}")
+    else:
+        trainer.save_model(args.output_dir)
+        print(f"Model saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
